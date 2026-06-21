@@ -1,0 +1,2 @@
+name: kaappi-pg
+build: make
