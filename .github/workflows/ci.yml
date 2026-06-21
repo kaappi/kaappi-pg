@@ -8,18 +8,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: runner
-          POSTGRES_PASSWORD: runner
-          POSTGRES_DB: kaappi_test
-        ports:
-          - 5432:5432
-        options: --health-cmd pg_isready --health-interval 10s
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -29,8 +18,12 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Install PostgreSQL client
-        run: sudo apt-get install -y libpq-dev
+      - name: Start PostgreSQL
+        run: |
+          brew install postgresql@14
+          brew services start postgresql@14
+          sleep 3
+          /opt/homebrew/opt/postgresql@14/bin/createdb kaappi_test || true
 
       - name: Build Kaappi
         run: |
@@ -40,14 +33,11 @@ jobs:
       - name: Build native library
         run: make
 
-      - name: Run type tests
+      - name: Run type tests (offline)
         run: /tmp/kaappi/zig-out/bin/kaappi --lib-path lib tests/test-types.scm
 
       - name: Run DB-API tests
         run: |
           /tmp/kaappi/zig-out/bin/kaappi --lib-path lib tests/test-dbapi.scm
         env:
-          PGHOST: localhost
-          PGUSER: runner
-          PGPASSWORD: runner
-          LD_LIBRARY_PATH: ${{ github.workspace }}
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}
