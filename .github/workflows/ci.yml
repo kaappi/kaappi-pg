@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: runner
+          POSTGRES_PASSWORD: runner
+          POSTGRES_DB: kaappi_test
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 10s
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get install -y libpq-dev
+
+      - name: Build Kaappi
+        run: |
+          git clone --depth 1 https://github.com/kaappi/kaappi.git /tmp/kaappi
+          cd /tmp/kaappi && zig build
+
+      - name: Build native library
+        run: make
+
+      - name: Run type tests
+        run: /tmp/kaappi/zig-out/bin/kaappi --lib-path lib tests/test-types.scm
+
+      - name: Run DB-API tests
+        run: |
+          /tmp/kaappi/zig-out/bin/kaappi --lib-path lib tests/test-dbapi.scm
+        env:
+          PGHOST: localhost
+          PGUSER: runner
+          PGPASSWORD: runner
+          LD_LIBRARY_PATH: ${{ github.workspace }}
