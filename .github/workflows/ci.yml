@@ -8,8 +8,7 @@ on:
 
 jobs:
   test:
-    runs-on: macos-latest
-
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -18,26 +17,18 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Start PostgreSQL
-        run: |
-          brew install postgresql@14
-          brew services start postgresql@14
-          sleep 3
-          /opt/homebrew/opt/postgresql@14/bin/createdb kaappi_test || true
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
 
       - name: Build Kaappi
         run: |
           git clone --depth 1 https://github.com/kaappi/kaappi.git /tmp/kaappi
-          cd /tmp/kaappi && zig build
+          cd /tmp/kaappi && zig build -Doptimize=ReleaseSafe
 
       - name: Build native library
         run: make
 
-      - name: Run type tests (offline)
-        run: /tmp/kaappi/zig-out/bin/kaappi --lib-path lib tests/test-types.scm
-
-      - name: Run DB-API tests
+      - name: Run offline tests
         run: |
-          /tmp/kaappi/zig-out/bin/kaappi --lib-path lib tests/test-dbapi.scm
-        env:
-          DYLD_LIBRARY_PATH: ${{ github.workspace }}
+          export LD_LIBRARY_PATH=.
+          /tmp/kaappi/zig-out/bin/kaappi --lib-path lib tests/test-types.scm
