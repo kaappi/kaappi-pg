@@ -1,5 +1,5 @@
 (define-library (kaappi pg)
-  (import (scheme base) (kaappi pg ffi) (kaappi pg types))
+  (import (scheme base) (kaappi fibers) (kaappi pg ffi) (kaappi pg types))
   (export pg-connect pg-close pg-connected? pg-error-message
           pg-cursor pg-execute pg-fetchone pg-fetchall pg-fetchmany
           pg-description pg-rowcount pg-cursor-close
@@ -7,6 +7,93 @@
           pg-exec pg-query
           call-with-pg-connection call-with-pg-transaction)
   (begin
+
+    ;; --- Async plumbing (KEP-0001 Phase 6) ---
+    ;;
+    ;; Every libpq call that would traditionally block (connect, send,
+    ;; fetch) is driven through its async counterpart and a poll loop
+    ;; instead: PQconnectStart/PQconnectPoll for connect,
+    ;; PQsendQuery(Params)+PQflush for send, PQisBusy/PQconsumeInput/
+    ;; PQgetResult to drain. Waiting for the socket blocks in poll(2) for
+    ;; a short bounded slice (%poll-timeout-ms) rather than the whole
+    ;; query, then calls (yield) so an already-ready sibling fiber gets a
+    ;; turn before this fiber's next attempt.
+    ;;
+    ;; (yield), not thread-sleep!, is what makes this safe: thread-sleep!
+    ;; always drives the scheduler via a nested runSchedulerStep/runUntil
+    ;; call regardless of the calling fiber's context, so two fibers each
+    ;; sleeping through hundreds of short retries pile up hundreds of
+    ;; nested native stack frames (each only unwinds once its own timer
+    ;; fires) instead of the flat suspend/resume waitForFd uses for other
+    ;; blocking I/O — under load this manifests as multi-second stalls,
+    ;; not a clean hang. yield sets a flag the *existing* dispatch loop
+    ;; checks (vm_dispatch.zig's runUntil), so it returns Yielded up
+    ;; through one frame instead of recursing into a new one. Filed as a
+    ;; kaappi core follow-up; until it lands, avoid thread-sleep! in any
+    ;; retry loop a spawned fiber can re-enter many times.
+    (define %poll-timeout-ms 1)
+
+    (define (pg-wait-readable ptr)
+      (let loop ()
+        (let ((r (%pg-poll-read (%pg-socket ptr) %poll-timeout-ms)))
+          (cond
+            ((= r 1) #t)
+            ((= r 0) (yield) (loop))
+            (else (error "pg: poll failed" (%pg-error-message ptr)))))))
+
+    (define (pg-wait-writable ptr)
+      (let loop ()
+        (let ((r (%pg-poll-write (%pg-socket ptr) %poll-timeout-ms)))
+          (cond
+            ((= r 1) #t)
+            ((= r 0) (yield) (loop))
+            (else (error "pg: poll failed" (%pg-error-message ptr)))))))
+
+    (define (pg-connect-poll-loop ptr)
+      (let loop ()
+        (let ((status (%pg-connect-poll ptr)))
+          (cond
+            ((= status PGRES_POLLING_OK) #t)
+            ((= status PGRES_POLLING_FAILED) #f)
+            ((= status PGRES_POLLING_READING) (pg-wait-readable ptr) (loop))
+            ((= status PGRES_POLLING_WRITING) (pg-wait-writable ptr) (loop))
+            (else (loop))))))
+
+    ;; Drains any unsent output after PQsendQuery(Params); PQflush returns
+    ;; 1 when more remains (wait for writability and retry), 0 when done.
+    (define (pg-flush-loop ptr)
+      (let loop ()
+        (let ((rc (%pg-flush ptr)))
+          (cond
+            ((= rc 0) #t)
+            ((= rc 1) (pg-wait-writable ptr) (loop))
+            (else (error "pg: flush failed" (%pg-error-message ptr)))))))
+
+    ;; Standard libpq async result drain: while busy, wait for readability
+    ;; and consume input; once not busy, PQgetResult won't block. Keeps
+    ;; only the last non-NULL result (PQexec's documented behavior for a
+    ;; multi-statement string), clearing any earlier ones.
+    (define (pg-drain-result ptr)
+      (let loop ((final 0))
+        (let busy-loop ()
+          (when (= (%pg-is-busy ptr) 1)
+            (pg-wait-readable ptr)
+            (when (= (%pg-consume-input ptr) 0)
+              (error "pg: consume input failed" (%pg-error-message ptr)))
+            (busy-loop)))
+        (let ((res (%pg-get-result ptr)))
+          (if (= res 0)
+              final
+              (begin
+                (when (not (= final 0)) (%pg-clear final))
+                (loop res))))))
+
+    (define (pg-send-and-drain ptr params?)
+      (let ((ok (if params? (%pg-send-query-params ptr) (%pg-send-query ptr))))
+        (when (= ok 0)
+          (error "pg: send query failed" (%pg-error-message ptr))))
+      (pg-flush-loop ptr)
+      (pg-drain-result ptr))
 
     ;; --- Connection record ---
 
@@ -16,11 +103,13 @@
       (ptr pg-conn-ptr set-pg-conn-ptr!))
 
     (define (pg-connect conninfo)
-      (let ((ptr (%pg-connect conninfo)))
+      (let ((ptr (%pg-connect-start conninfo)))
+        (pg-connect-poll-loop ptr)
         (when (= (%pg-status ptr) CONNECTION_BAD)
           (let ((msg (%pg-error-message ptr)))
             (%pg-finish ptr)
             (error "pg-connect failed" msg)))
+        (%pg-set-nonblocking ptr)
         (%make-pg-connection ptr)))
 
     (define (pg-close conn)
@@ -57,21 +146,35 @@
     ;; --- Execute ---
 
     (define (pg-execute cursor sql . params)
+      (pg-execute-list cursor sql params))
+
+    ;; Takes params as a plain list rather than a rest-arg so pg-exec/
+    ;; pg-query can forward their own captured params without `apply` —
+    ;; apply invokes its target closure via the VM's native-reentrant call
+    ;; path (vm_calls.callReentrant), which bumps native_reentry_depth for
+    ;; the closure's *entire* dynamic extent; yield checks that depth and
+    ;; silently no-ops while it's nonzero (by design, for guard/handler
+    ;; thunks — see primitives_fiber.zig's yieldFn), so every yield inside
+    ;; pg-wait-readable/pg-wait-writable would be a no-op for the rest of
+    ;; this call tree, serializing concurrent fibers instead of
+    ;; interleaving them. A direct call compiles to a plain bytecode
+    ;; CALL/TAILCALL and never touches that counter.
+    (define (pg-execute-list cursor sql params)
       (pg-cursor-close cursor)
       (let* ((conn-ptr (pg-conn-ptr (cursor-conn cursor)))
              (res (if (null? params)
-                      (begin (%pg-set-sql sql)
-                             (%pg-exec conn-ptr))
-                      (begin (%pg-set-sql sql)
-                             (%pg-clear-params)
+                      (begin (%pg-set-sql conn-ptr sql)
+                             (pg-send-and-drain conn-ptr #f))
+                      (begin (%pg-set-sql conn-ptr sql)
+                             (%pg-clear-params conn-ptr)
                              (for-each
                                (lambda (p)
                                  (let ((converted (pg-convert-param p)))
                                    (if converted
-                                       (%pg-add-param converted)
-                                       (%pg-add-null-param))))
+                                       (%pg-add-param conn-ptr converted)
+                                       (%pg-add-null-param conn-ptr))))
                                params)
-                             (%pg-exec-params conn-ptr))))
+                             (pg-send-and-drain conn-ptr #t))))
              (status (%pg-result-status res)))
         (when (= status PGRES_FATAL_ERROR)
           (let ((msg (%pg-result-error res)))
@@ -171,14 +274,14 @@
 
     (define (pg-exec conn sql . params)
       (let ((cur (pg-cursor conn)))
-        (apply pg-execute cur sql params)
+        (pg-execute-list cur sql params)
         (let ((rc (pg-rowcount cur)))
           (pg-cursor-close cur)
           rc)))
 
     (define (pg-query conn sql . params)
       (let ((cur (pg-cursor conn)))
-        (apply pg-execute cur sql params)
+        (pg-execute-list cur sql params)
         (let ((rows (pg-fetchall cur)))
           (pg-cursor-close cur)
           rows)))

@@ -2,106 +2,215 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
+#include <poll.h>
 #include <libpq-fe.h>
 
 /* -----------------------------------------------------------------------
-   Query state — set-then-execute pattern for multi-arg calls that don't
-   match Kaappi's FFI dispatch table.  Single-threaded, so global state
-   is safe.
+   Connection state — one KpgConn per PGconn, holding the "set-then-send"
+   query buffer that used to be process-global. It must live per-connection
+   now: PQsendQuery/PQsendQueryParams don't block, so a fiber can suspend
+   mid-query (waiting on socket readiness) and hand the OS thread to a
+   sibling fiber that runs a query on a different connection. A single
+   shared buffer would let that sibling clobber the SQL/params still
+   in flight on this one.
    ----------------------------------------------------------------------- */
 
 #define MAX_PARAMS 64
 
-static char  stored_sql[16384];
-static int   param_count = 0;
-static char *param_values[MAX_PARAMS];
+typedef struct {
+    PGconn *conn;
+    char    sql[16384];
+    int     param_count;
+    char   *param_values[MAX_PARAMS];
+} KpgConn;
 
 /* -----------------------------------------------------------------------
-   Connection
+   Connection — async (PQconnectStart/PQconnectPoll), so the handshake
+   never blocks the OS thread. lib/kaappi/pg.sld drives kpg_connect_poll
+   in a loop, waiting on kpg_socket's readiness between calls exactly like
+   kaappi-net's TLS handshake (KEP-0001 Phase 6).
    ----------------------------------------------------------------------- */
 
 /* (string) -> pointer */
-void *kpg_connect(const char *conninfo) {
-    PGconn *conn = PQconnectdb(conninfo);
-    return (void *)conn;
+void *kpg_connect_start(const char *conninfo) {
+    PGconn *conn = PQconnectStart(conninfo);
+    if (!conn) return NULL;
+    KpgConn *kc = calloc(1, sizeof(KpgConn));
+    if (!kc) { PQfinish(conn); return NULL; }
+    kc->conn = conn;
+    return kc;
+}
+
+/* (pointer) -> int — PostgresPollingStatusType: FAILED=0 READING=1
+   WRITING=2 OK=3 ACTIVE=4(deprecated) */
+int kpg_connect_poll(void *kconn) {
+    return (int)PQconnectPoll(((KpgConn *)kconn)->conn);
+}
+
+/* (pointer) -> int — 1 on success, per PQsetnonblocking. Called once the
+   connection is up so PQflush (inside PQsendQuery/PQsendQueryParams)
+   never blocks either. */
+int kpg_set_nonblocking(void *kconn) {
+    return PQsetnonblocking(((KpgConn *)kconn)->conn, 1) == 0 ? 1 : 0;
+}
+
+/* (pointer) -> int — the socket fd, for the caller to poll. */
+int kpg_socket(void *kconn) {
+    return PQsocket(((KpgConn *)kconn)->conn);
 }
 
 /* (pointer) -> int   — CONNECTION_OK = 0, CONNECTION_BAD = 1 */
-int kpg_status(void *conn) {
-    return (int)PQstatus((PGconn *)conn);
+int kpg_status(void *kconn) {
+    return (int)PQstatus(((KpgConn *)kconn)->conn);
 }
 
 /* (pointer) -> void */
-void kpg_finish(void *conn) {
-    PQfinish((PGconn *)conn);
+void kpg_finish(void *kconn) {
+    KpgConn *kc = (KpgConn *)kconn;
+    if (!kc) return;
+    PQfinish(kc->conn);
+    for (int i = 0; i < kc->param_count; i++) free(kc->param_values[i]);
+    free(kc);
 }
 
 /* (pointer) -> string */
-const char *kpg_error_message(void *conn) {
-    return PQerrorMessage((PGconn *)conn);
+const char *kpg_error_message(void *kconn) {
+    return PQerrorMessage(((KpgConn *)kconn)->conn);
 }
 
 /* -----------------------------------------------------------------------
-   Query setup
+   Query setup — now keyed on the connection's own buffer.
    ----------------------------------------------------------------------- */
 
-/* (string) -> void */
-void kpg_set_sql(const char *sql) {
-    strncpy(stored_sql, sql, sizeof(stored_sql) - 1);
-    stored_sql[sizeof(stored_sql) - 1] = '\0';
+/* (pointer, string) -> void */
+void kpg_set_sql(void *kconn, const char *sql) {
+    KpgConn *kc = (KpgConn *)kconn;
+    strncpy(kc->sql, sql, sizeof(kc->sql) - 1);
+    kc->sql[sizeof(kc->sql) - 1] = '\0';
 }
 
-/* () -> void */
-void kpg_clear_params(void) {
-    for (int i = 0; i < param_count; i++) {
-        free(param_values[i]);
-        param_values[i] = NULL;
+/* (pointer) -> void */
+void kpg_clear_params(void *kconn) {
+    KpgConn *kc = (KpgConn *)kconn;
+    for (int i = 0; i < kc->param_count; i++) {
+        free(kc->param_values[i]);
+        kc->param_values[i] = NULL;
     }
-    param_count = 0;
+    kc->param_count = 0;
 }
 
-/* (string) -> void */
-void kpg_add_param(const char *value) {
-    if (param_count >= MAX_PARAMS) return;
-    param_values[param_count] = strdup(value);
-    param_count++;
+/* (pointer, string) -> void */
+void kpg_add_param(void *kconn, const char *value) {
+    KpgConn *kc = (KpgConn *)kconn;
+    if (kc->param_count >= MAX_PARAMS) return;
+    kc->param_values[kc->param_count] = strdup(value);
+    kc->param_count++;
 }
 
-/* () -> int   (returns 0, signature needs a return for FFI match) */
-int kpg_add_null_param(void) {
-    if (param_count >= MAX_PARAMS) return -1;
-    param_values[param_count] = NULL;
-    param_count++;
+/* (pointer) -> int   (returns 0, signature needs a return for FFI match) */
+int kpg_add_null_param(void *kconn) {
+    KpgConn *kc = (KpgConn *)kconn;
+    if (kc->param_count >= MAX_PARAMS) return -1;
+    kc->param_values[kc->param_count] = NULL;
+    kc->param_count++;
     return 0;
 }
 
 /* -----------------------------------------------------------------------
-   Query execution
+   Query execution — async (PQsendQuery/PQsendQueryParams). The caller
+   drains the result with kpg_is_busy/kpg_consume_input/kpg_get_result,
+   waiting on kpg_socket's readiness whenever kpg_is_busy says so, instead
+   of blocking in PQexec/PQexecParams.
    ----------------------------------------------------------------------- */
 
-/* (pointer) -> pointer — simple exec (no params) */
-void *kpg_exec(void *conn) {
-    return (void *)PQexec((PGconn *)conn, stored_sql);
+/* (pointer) -> int — 1 on success, 0 on failure (see kpg_error_message) */
+int kpg_send_query(void *kconn) {
+    KpgConn *kc = (KpgConn *)kconn;
+    return PQsendQuery(kc->conn, kc->sql);
 }
 
-/* (pointer) -> pointer — parameterised exec */
-void *kpg_exec_params(void *conn) {
-    PGresult *res = PQexecParams(
-        (PGconn *)conn,
-        stored_sql,
-        param_count,
+/* (pointer) -> int — 1 on success, 0 on failure */
+int kpg_send_query_params(void *kconn) {
+    KpgConn *kc = (KpgConn *)kconn;
+    int ok = PQsendQueryParams(
+        kc->conn,
+        kc->sql,
+        kc->param_count,
         NULL,                           /* paramTypes — let server infer */
-        (const char *const *)param_values,
+        (const char *const *)kc->param_values,
         NULL,                           /* paramLengths — text format */
         NULL,                           /* paramFormats — all text */
         0                               /* resultFormat — text */
     );
-    kpg_clear_params();
-    return (void *)res;
+    kpg_clear_params(kconn);
+    return ok;
+}
+
+/* (pointer) -> int — 0 if all pending output was sent, 1 if more remains
+   (poll for write-readiness and call again), -1 on error. */
+int kpg_flush(void *kconn) {
+    return PQflush(((KpgConn *)kconn)->conn);
+}
+
+/* (pointer) -> int — 1 on success (may have read 0 bytes), 0 on error. */
+int kpg_consume_input(void *kconn) {
+    return PQconsumeInput(((KpgConn *)kconn)->conn);
+}
+
+/* (pointer) -> int — 1 if a call to kpg_get_result would block. */
+int kpg_is_busy(void *kconn) {
+    return PQisBusy(((KpgConn *)kconn)->conn);
+}
+
+/* (pointer) -> pointer — next result, or NULL (returned as 0) once the
+   query is fully drained. Only safe to call when kpg_is_busy is 0. */
+void *kpg_get_result(void *kconn) {
+    return (void *)PQgetResult(((KpgConn *)kconn)->conn);
 }
 
 /* -----------------------------------------------------------------------
-   Result status
+   Raw-fd polling — same poll(2) convention as kaappi-net's
+   knet_poll_read/knet_poll_write (1 ready, 0 timeout, -1 error).
+   Duplicated rather than depending on kaappi-net for six lines of code.
+   ----------------------------------------------------------------------- */
+
+/* (int, int) -> int — retries on EINTR: a nonzero (blocking) timeout
+   gives a signal a real window to interrupt the syscall. Checks POLLIN
+   before POLLHUP/POLLERR: a connection that delivers its last bytes and
+   hangs up in the same instant sets both, and there's still unread data
+   in the socket buffer — only a hangup/error with *no* pending data is a
+   real "never becomes readable" condition. */
+int kpg_poll_read(int fd, int timeout_ms) {
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int rc;
+    do {
+        rc = poll(&pfd, 1, timeout_ms);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0) return -1;
+    if (rc == 0) return 0;
+    if (pfd.revents & POLLIN) return 1;
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
+    return 1;
+}
+
+/* (int, int) -> int — see kpg_poll_read for why EINTR is retried and
+   POLLOUT is checked before POLLHUP/POLLERR. */
+int kpg_poll_write(int fd, int timeout_ms) {
+    struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+    int rc;
+    do {
+        rc = poll(&pfd, 1, timeout_ms);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0) return -1;
+    if (rc == 0) return 0;
+    if (pfd.revents & POLLOUT) return 1;
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+   Result status — operate on a PGresult*, independent of KpgConn.
    ----------------------------------------------------------------------- */
 
 /* (pointer) -> int */
@@ -183,8 +292,8 @@ void kpg_free_ptr(void *ptr) {
 /* (pointer, pointer) -> pointer
    Escape a string literal.  The string is passed as a bytevector pointer.
    Returns malloc'd string including quotes; free with kpg_free_ptr. */
-void *kpg_escape_literal(void *conn, void *str_ptr) {
+void *kpg_escape_literal(void *kconn, void *str_ptr) {
     const char *str = (const char *)str_ptr;
     size_t len = strlen(str);
-    return (void *)PQescapeLiteral((PGconn *)conn, str, len);
+    return (void *)PQescapeLiteral(((KpgConn *)kconn)->conn, str, len);
 }
