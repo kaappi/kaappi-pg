@@ -47,6 +47,12 @@ jobs:
           LD_LIBRARY_PATH: .
           DYLD_LIBRARY_PATH: .
 
+      - name: Run connection lifecycle tests (skips without a server)
+        run: /tmp/kaappi/zig-out/bin/kaappi --lib-path lib tests/test-pg.scm
+        env:
+          LD_LIBRARY_PATH: .
+          DYLD_LIBRARY_PATH: .
+
       - name: Upload to Codecov
         if: github.event_name == 'push' && matrix.os == 'ubuntu-latest'
         uses: codecov/codecov-action@v5

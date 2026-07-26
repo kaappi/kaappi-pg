@@ -113,6 +113,9 @@ kaappi --lib-path lib tests/test-types.scm
 # Full DB-API tests (requires PostgreSQL)
 createdb kaappi_test
 DYLD_LIBRARY_PATH=. kaappi --lib-path lib tests/test-dbapi.scm
+
+# Connection lifecycle regression tests (skips when no server is reachable)
+DYLD_LIBRARY_PATH=. kaappi --lib-path lib tests/test-pg.scm
 ```
 
 ## Requirements
