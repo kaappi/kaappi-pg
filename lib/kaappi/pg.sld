@@ -109,6 +109,8 @@
 
     (define (pg-connect conninfo)
       (let ((ptr (%pg-connect-start conninfo)))
+        (when (= ptr 0)
+          (error "pg-connect failed" "could not allocate connection"))
         (pg-connect-poll-loop ptr)
         (when (= (%pg-status ptr) CONNECTION_BAD)
           (let ((msg (%pg-error-message ptr)))
@@ -125,8 +127,19 @@
     (define (pg-connected? conn)
       (not (= (pg-conn-ptr conn) 0)))
 
+    ;; pg-close zeroes the handle, so a closed connection must never reach
+    ;; the FFI: the C side would dereference NULL and take the whole
+    ;; process down. Raise a normal Scheme error instead.
+    (define (%check-open conn)
+      (unless (pg-connected? conn)
+        (error "pg: connection is closed")))
+
+    ;; Total on closed connections (returns instead of raising): this is a
+    ;; diagnostic accessor, often called from error handlers.
     (define (pg-error-message conn)
-      (%pg-error-message (pg-conn-ptr conn)))
+      (if (pg-connected? conn)
+          (%pg-error-message (pg-conn-ptr conn))
+          "connection is closed"))
 
     ;; --- Cursor record ---
 
@@ -165,6 +178,7 @@
     ;; interleaving them. A direct call compiles to a plain bytecode
     ;; CALL/TAILCALL and never touches that counter.
     (define (pg-execute-list cursor sql params)
+      (%check-open (cursor-conn cursor))
       (pg-cursor-close cursor)
       (let* ((conn-ptr (pg-conn-ptr (cursor-conn cursor)))
              (res (if (null? params)

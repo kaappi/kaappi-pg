@@ -14,6 +14,11 @@
    sibling fiber that runs a query on a different connection. A single
    shared buffer would let that sibling clobber the SQL/params still
    in flight on this one.
+
+   Every function taking a KpgConn* guards against NULL: the Scheme layer
+   zeroes its handle on pg-close, so a use-after-close hands NULL in here.
+   The wrapper raises before calling us, but a caller going through
+   (kaappi pg ffi) directly gets a soft failure code instead of a segfault.
    ----------------------------------------------------------------------- */
 
 #define MAX_PARAMS 64
@@ -45,6 +50,7 @@ void *kpg_connect_start(const char *conninfo) {
 /* (pointer) -> int — PostgresPollingStatusType: FAILED=0 READING=1
    WRITING=2 OK=3 ACTIVE=4(deprecated) */
 int kpg_connect_poll(void *kconn) {
+    if (!kconn) return PGRES_POLLING_FAILED;
     return (int)PQconnectPoll(((KpgConn *)kconn)->conn);
 }
 
@@ -52,16 +58,19 @@ int kpg_connect_poll(void *kconn) {
    connection is up so PQflush (inside PQsendQuery/PQsendQueryParams)
    never blocks either. */
 int kpg_set_nonblocking(void *kconn) {
+    if (!kconn) return 0;
     return PQsetnonblocking(((KpgConn *)kconn)->conn, 1) == 0 ? 1 : 0;
 }
 
 /* (pointer) -> int — the socket fd, for the caller to poll. */
 int kpg_socket(void *kconn) {
+    if (!kconn) return -1;
     return PQsocket(((KpgConn *)kconn)->conn);
 }
 
 /* (pointer) -> int   — CONNECTION_OK = 0, CONNECTION_BAD = 1 */
 int kpg_status(void *kconn) {
+    if (!kconn) return CONNECTION_BAD;
     return (int)PQstatus(((KpgConn *)kconn)->conn);
 }
 
@@ -76,6 +85,7 @@ void kpg_finish(void *kconn) {
 
 /* (pointer) -> string */
 const char *kpg_error_message(void *kconn) {
+    if (!kconn) return "connection is closed\n";
     return PQerrorMessage(((KpgConn *)kconn)->conn);
 }
 
@@ -86,6 +96,7 @@ const char *kpg_error_message(void *kconn) {
 /* (pointer, string) -> void */
 void kpg_set_sql(void *kconn, const char *sql) {
     KpgConn *kc = (KpgConn *)kconn;
+    if (!kc) return;
     strncpy(kc->sql, sql, sizeof(kc->sql) - 1);
     kc->sql[sizeof(kc->sql) - 1] = '\0';
 }
@@ -93,6 +104,7 @@ void kpg_set_sql(void *kconn, const char *sql) {
 /* (pointer) -> void */
 void kpg_clear_params(void *kconn) {
     KpgConn *kc = (KpgConn *)kconn;
+    if (!kc) return;
     for (int i = 0; i < kc->param_count; i++) {
         free(kc->param_values[i]);
         kc->param_values[i] = NULL;
@@ -103,6 +115,7 @@ void kpg_clear_params(void *kconn) {
 /* (pointer, string) -> void */
 void kpg_add_param(void *kconn, const char *value) {
     KpgConn *kc = (KpgConn *)kconn;
+    if (!kc) return;
     if (kc->param_count >= MAX_PARAMS) return;
     kc->param_values[kc->param_count] = strdup(value);
     kc->param_count++;
@@ -111,6 +124,7 @@ void kpg_add_param(void *kconn, const char *value) {
 /* (pointer) -> int   (returns 0, signature needs a return for FFI match) */
 int kpg_add_null_param(void *kconn) {
     KpgConn *kc = (KpgConn *)kconn;
+    if (!kc) return -1;
     if (kc->param_count >= MAX_PARAMS) return -1;
     kc->param_values[kc->param_count] = NULL;
     kc->param_count++;
@@ -127,12 +141,14 @@ int kpg_add_null_param(void *kconn) {
 /* (pointer) -> int — 1 on success, 0 on failure (see kpg_error_message) */
 int kpg_send_query(void *kconn) {
     KpgConn *kc = (KpgConn *)kconn;
+    if (!kc) return 0;
     return PQsendQuery(kc->conn, kc->sql);
 }
 
 /* (pointer) -> int — 1 on success, 0 on failure */
 int kpg_send_query_params(void *kconn) {
     KpgConn *kc = (KpgConn *)kconn;
+    if (!kc) return 0;
     int ok = PQsendQueryParams(
         kc->conn,
         kc->sql,
@@ -150,22 +166,26 @@ int kpg_send_query_params(void *kconn) {
 /* (pointer) -> int — 0 if all pending output was sent, 1 if more remains
    (poll for write-readiness and call again), -1 on error. */
 int kpg_flush(void *kconn) {
+    if (!kconn) return -1;
     return PQflush(((KpgConn *)kconn)->conn);
 }
 
 /* (pointer) -> int — 1 on success (may have read 0 bytes), 0 on error. */
 int kpg_consume_input(void *kconn) {
+    if (!kconn) return 0;
     return PQconsumeInput(((KpgConn *)kconn)->conn);
 }
 
 /* (pointer) -> int — 1 if a call to kpg_get_result would block. */
 int kpg_is_busy(void *kconn) {
+    if (!kconn) return 0;
     return PQisBusy(((KpgConn *)kconn)->conn);
 }
 
 /* (pointer) -> pointer — next result, or NULL (returned as 0) once the
    query is fully drained. Only safe to call when kpg_is_busy is 0. */
 void *kpg_get_result(void *kconn) {
+    if (!kconn) return NULL;
     return (void *)PQgetResult(((KpgConn *)kconn)->conn);
 }
 
@@ -293,6 +313,7 @@ void kpg_free_ptr(void *ptr) {
    Escape a string literal.  The string is passed as a bytevector pointer.
    Returns malloc'd string including quotes; free with kpg_free_ptr. */
 void *kpg_escape_literal(void *kconn, void *str_ptr) {
+    if (!kconn) return NULL;
     const char *str = (const char *)str_ptr;
     size_t len = strlen(str);
     return (void *)PQescapeLiteral(((KpgConn *)kconn)->conn, str, len);
